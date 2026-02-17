@@ -8,17 +8,27 @@ const PORT = process.env.PORT || 3000;
 
 // Configuration
 const config = {
-  clientId: process.env.SPOTIFY_CLIENT_ID,
-  clientSecret: process.env.SPOTIFY_CLIENT_SECRET,
-  clientCallbackUrl: process.env.SPOTIFY_CLIENT_CALLBACK_URL,
+  spotify: {
+    clientId: process.env.SPOTIFY_CLIENT_ID,
+    clientSecret: process.env.SPOTIFY_CLIENT_SECRET,
+    clientCallbackUrl: process.env.SPOTIFY_CLIENT_CALLBACK_URL,
+  },
+  strava: {
+    clientId: process.env.STRAVA_CLIENT_ID,
+    clientSecret: process.env.STRAVA_CLIENT_SECRET,
+  },
   encryptionSecret: process.env.ENCRYPTION_SECRET,
 };
 
-// Validate required configuration
+// Validate that at least one service is configured
 function validateConfig() {
-  if (!config.clientId || !config.clientSecret || !config.clientCallbackUrl) {
-    throw new Error('client credentials are empty');
+  const hasSpotify = config.spotify.clientId && config.spotify.clientSecret && config.spotify.clientCallbackUrl;
+  const hasStrava = config.strava.clientId && config.strava.clientSecret;
+  if (!hasSpotify && !hasStrava) {
+    throw new Error('No service configured. Set SPOTIFY_CLIENT_* or STRAVA_CLIENT_* env vars.');
   }
+  if (hasSpotify) console.log('Spotify token service: enabled');
+  if (hasStrava) console.log('Strava token service: enabled');
 }
 
 validateConfig();
@@ -68,7 +78,7 @@ function decrypt(text) {
 
 // HTTP helper for Spotify API
 async function spotifyRequest(grantType, params) {
-  const credentials = Buffer.from(`${config.clientId}:${config.clientSecret}`).toString('base64');
+  const credentials = Buffer.from(`${config.spotify.clientId}:${config.spotify.clientSecret}`).toString('base64');
 
   const body = new URLSearchParams({
     grant_type: grantType,
@@ -79,6 +89,27 @@ async function spotifyRequest(grantType, params) {
     method: 'POST',
     headers: {
       'Authorization': `Basic ${credentials}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: body.toString(),
+  });
+
+  const data = await response.json();
+  return { status: response.status, data };
+}
+
+// HTTP helper for Strava API
+async function stravaRequest(grantType, params) {
+  const body = new URLSearchParams({
+    client_id: config.strava.clientId,
+    client_secret: config.strava.clientSecret,
+    grant_type: grantType,
+    ...params,
+  });
+
+  const response = await fetch('https://www.strava.com/oauth/token', {
+    method: 'POST',
+    headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
     },
     body: body.toString(),
@@ -103,11 +134,11 @@ app.post('/api/spotify/token', async (req, res) => {
     }
 
     console.log('Code received:', code.substring(0, 20) + '...');
-    console.log('Redirect URI:', config.clientCallbackUrl);
+    console.log('Redirect URI:', config.spotify.clientCallbackUrl);
 
     const { status, data } = await spotifyRequest('authorization_code', {
       code,
-      redirect_uri: config.clientCallbackUrl,
+      redirect_uri: config.spotify.clientCallbackUrl,
     });
 
     console.log('Spotify API response status:', status);
@@ -174,9 +205,89 @@ app.post('/api/spotify/refresh_token', async (req, res) => {
   }
 });
 
+// GET /api/strava/callback
+// OAuth trampoline: Strava redirects here with ?code=...&state=routevideo://strava
+// We redirect to the custom scheme URL so ASWebAuthenticationSession can intercept it.
+app.get('/api/strava/callback', (req, res) => {
+  const { code, state, scope, error } = req.query;
+  console.log(`=== STRAVA OAUTH CALLBACK ===`);
+  console.log('code:', code ? `${code.substring(0, 20)}...` : 'MISSING');
+  console.log('state:', state);
+
+  if (!state) {
+    return res.status(400).send('Missing state parameter.');
+  }
+
+  // Build the deep link URL from the state parameter
+  const separator = state.includes('?') ? '&' : '?';
+  const params = new URLSearchParams();
+  if (code) params.set('code', code);
+  if (scope) params.set('scope', scope);
+  if (error) params.set('error', error);
+  const deepLink = `${state}${separator}${params.toString()}`;
+
+  console.log('Redirecting to:', deepLink);
+
+  // Redirect to the custom scheme — ASWebAuthenticationSession will catch this
+  res.redirect(deepLink);
+});
+
+// POST /api/strava/token
+// Handle both authorization_code exchange and refresh_token for Strava.
+// The iOS app sends JSON: { grant_type, client_id, code } or { grant_type, client_id, refresh_token }
+// This endpoint injects the client_secret and forwards to Strava.
+app.post('/api/strava/token', async (req, res) => {
+  const grantType = req.body.grant_type;
+  console.log(`=== STRAVA TOKEN REQUEST (${grantType}) ===`);
+
+  try {
+    if (!config.strava.clientId || !config.strava.clientSecret) {
+      return res.status(500).json({ error: 'Strava is not configured on the server.' });
+    }
+
+    if (grantType === 'authorization_code') {
+      const code = req.body.code;
+      if (!code) {
+        return res.status(400).json({ error: 'code is required' });
+      }
+
+      console.log('Code received:', code.substring(0, 20) + '...');
+      const { status, data } = await stravaRequest('authorization_code', { code });
+
+      console.log('Strava API response status:', status);
+      console.log('Has access_token:', !!data.access_token);
+      console.log('Has refresh_token:', !!data.refresh_token);
+      console.log('Expires at:', data.expires_at);
+
+      res.status(status).json(data);
+    } else if (grantType === 'refresh_token') {
+      const refreshToken = req.body.refresh_token;
+      if (!refreshToken) {
+        return res.status(400).json({ error: 'refresh_token is required' });
+      }
+
+      console.log('Refreshing Strava token...');
+      const { status, data } = await stravaRequest('refresh_token', {
+        refresh_token: refreshToken,
+      });
+
+      console.log('Strava API response status:', status);
+      console.log('Has access_token:', !!data.access_token);
+      console.log('Expires at:', data.expires_at);
+
+      res.status(status).json(data);
+    } else {
+      res.status(400).json({ error: `unsupported grant_type: ${grantType}` });
+    }
+  } catch (err) {
+    console.log('ERROR in Strava token request:', err.message || err);
+    res.status(500).json({ error: err.message || err });
+  }
+});
+
 // Start server
 app.listen(PORT, () => {
-  console.log(`Spotify Token Swap Service running on port ${PORT}`);
+  console.log(`Token Swap Service running on port ${PORT}`);
 });
 
 module.exports = app;
