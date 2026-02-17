@@ -205,6 +205,33 @@ app.post('/api/spotify/refresh_token', async (req, res) => {
   }
 });
 
+// GET /api/strava/callback
+// OAuth trampoline: Strava redirects here with ?code=...&state=routevideo://strava
+// We redirect to the custom scheme URL so ASWebAuthenticationSession can intercept it.
+app.get('/api/strava/callback', (req, res) => {
+  const { code, state, scope, error } = req.query;
+  console.log(`=== STRAVA OAUTH CALLBACK ===`);
+  console.log('code:', code ? `${code.substring(0, 20)}...` : 'MISSING');
+  console.log('state:', state);
+
+  if (!state) {
+    return res.status(400).send('Missing state parameter.');
+  }
+
+  // Build the deep link URL from the state parameter
+  const separator = state.includes('?') ? '&' : '?';
+  const params = new URLSearchParams();
+  if (code) params.set('code', code);
+  if (scope) params.set('scope', scope);
+  if (error) params.set('error', error);
+  const deepLink = `${state}${separator}${params.toString()}`;
+
+  console.log('Redirecting to:', deepLink);
+
+  // Redirect to the custom scheme — ASWebAuthenticationSession will catch this
+  res.redirect(deepLink);
+});
+
 // POST /api/strava/token
 // Handle both authorization_code exchange and refresh_token for Strava.
 // The iOS app sends JSON: { grant_type, client_id, code } or { grant_type, client_id, refresh_token }
